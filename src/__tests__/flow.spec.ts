@@ -56,7 +56,7 @@ describe('journey: OTP only (no card hardware)', () => {
     use((c) => { c.hardware.nfc = false; c.hardware.otp = true; });
     await startRental(1, 'locker');
     expect(S().stage).toBe('phone');
-    S().submitPhone('0917000000');
+    S().submitPhone('09170000000');
     expect(S().sms?.text).toContain(S().otp!.code);
     S().submitOtp(wrongOf(S().otp!.code)); expect(S().otpMsg).toMatch(/Incorrect/);
     S().submitOtp(S().otp!.code);
@@ -69,7 +69,7 @@ describe('journey: OTP only (no card hardware)', () => {
 
     S().screenClick(); S().startRetrieval();
     expect(S().retMethod).toBe('otp');
-    S().requestRetrievalOtp(1);
+    S().submitRetrievalPhone('09170000000');
     expect(S().ret).toBe('otp');
     S().submitRetrievalOtp(wrongOf(S().otp!.code)); expect(S().retMsg).toMatch(/Incorrect/);
     S().submitRetrievalOtp(S().otp!.code);
