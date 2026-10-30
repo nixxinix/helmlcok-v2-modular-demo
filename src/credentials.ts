@@ -29,6 +29,13 @@ export function matchCode<T extends Cred>(r: R<T>, code: string, now: number, tt
 }
 
 export interface Otp { code: string; expiresAt: number; attempts: number }
+/** Phone numbers: digits only, at most 11. Use cleanPhone() on every phone input (typing and pasting). */
+export const PHONE_DIGITS = 11;
+export const cleanPhone = (v: string) => v.replace(/\D/g, '').slice(0, PHONE_DIGITS);
+export const isPhone = (v: string) => new RegExp(`^\\d{${PHONE_DIGITS}}$`).test(v);
+export const matchPhone = <T extends Cred>(r: R<T>, phone: string): number[] => Object.entries(r).filter(([, x]) => x.phone === phone).map(([k]) => Number(k));
+/** Does this rental hold the credential for a retrieval method? */
+export const hasCred = (m: string, r: Cred) => (m === 'nfc' ? !!r.cardId : m === 'otp' ? !!r.phone : m === 'qr' ? !!r.qrToken : !!r.accessCode);
 export const newOtp = (now: number, ttlMs: number): Otp => ({ code: genOtp(), expiresAt: now + ttlMs, attempts: 0 });
 export function checkOtp<T extends Otp>(o: T | null, input: string, now: number, max: number): { ok: boolean; otp: T | null; error?: 'none' | 'expired' | 'locked' | 'wrong' } {
   if (!o) return { ok: false, otp: null, error: 'none' };

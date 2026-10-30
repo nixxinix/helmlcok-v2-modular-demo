@@ -2,8 +2,8 @@ import { ReactNode, useEffect, useState } from 'react';
 import QRCode from 'qrcode';
 import { useStore, viewId, balanceAfter, Rental, Stage } from './store';
 import { CONFIG, Wallet, priceOf, coinsOf } from './config';
-import { useConfig, useDerived, sanitationAt, totalSeconds, METHOD_LABEL, RetrievalMethod } from './system';
-import { qrPayload } from './credentials';
+import { useConfig, useDerived, sanitationAt, totalSeconds, methodLabel, RetrievalMethod } from './system';
+import { qrPayload, PHONE_DIGITS, hasCred } from './credentials';
 import { sfx } from './sound';
 import Admin from './Admin';
 
@@ -31,11 +31,12 @@ function QrImg({ text, size = 190 }: { text: string; size?: number }) {
   return url ? <img className="qr" src={url} width={size} height={size} alt="QR code" /> : <div className="qr" style={{ width: size, height: size }} />;
 }
 
-function CodeForm({ label, placeholder, cta, maxLength = 12, onSubmit }: { label: string; placeholder: string; cta: string; maxLength?: number; onSubmit: (v: string) => void }) {
+function CodeForm({ label, placeholder, cta, maxLength = 12, digitsOnly = false, onSubmit }: { label: string; placeholder: string; cta: string; maxLength?: number; digitsOnly?: boolean; onSubmit: (v: string) => void }) {
   const [v, setV] = useState('');
+  const clean = (x: string) => (digitsOnly ? x.replace(/\D/g, '') : x).slice(0, maxLength); // strips letters and truncates pasted text
   return (
-    <form className="codeform" onSubmit={(e) => { e.preventDefault(); onSubmit(v); }}>
-      <label>{label}<input autoFocus inputMode="numeric" value={v} maxLength={maxLength} placeholder={placeholder} onChange={(e) => setV(e.target.value)} /></label>
+    <form className="codeform" onSubmit={(e) => { e.preventDefault(); onSubmit(clean(v)); }}>
+      <label>{label}<input autoFocus inputMode={digitsOnly ? 'numeric' : 'text'} pattern={digitsOnly ? '[0-9]*' : undefined} value={v} maxLength={maxLength} placeholder={placeholder} onChange={(e) => setV(clean(e.target.value))} /></label>
       <button className="btn" type="submit">{cta}</button>
     </form>
   );
@@ -87,7 +88,7 @@ function SmsPhone() {
   );
 }
 
-interface ReceiptData { txnId: string; locker: number; service: string; method: string; amount: number; at: number | null; type: 'transaction' | 'retrieval'; qrToken?: string | null; accessCode?: string | null }
+interface ReceiptData { txnId: string; locker: number; service: string; method: string; amount: number; at: number | null; type: 'transaction' | 'retrieval'; qrToken?: string | null; accessCode?: string | null; emergency?: boolean }
 function Receipt({ r }: { r: ReceiptData }) {
   return (
     <div className="paper">
@@ -95,7 +96,8 @@ function Receipt({ r }: { r: ReceiptData }) {
       <dl><dt>Reference</dt><dd>{r.txnId}</dd><dt>Locker</dt><dd>{r.locker + 1}</dd><dt>Service</dt><dd>{r.service}</dd><dt>Payment</dt><dd>{r.method}</dd>
         <dt>Amount</dt><dd>{money(r.amount)}</dd><dt>Date</dt><dd>{when(r.at)}</dd><dt>Status</dt><dd>PAID</dd></dl>
       {r.qrToken && <QrImg text={qrPayload(r.qrToken)} size={120} />}
-      {r.accessCode && <div className="acode">Access code <b>{r.accessCode}</b></div>}
+      {r.accessCode && <div className="acode">{r.emergency ? 'Emergency code' : 'Access code'} <b>{r.accessCode}</b></div>}
+      {r.emergency && (r.qrToken || r.accessCode) && <small>Use only if your access card is lost.</small>}
       {r.type === 'transaction' && <small>Record only. Not valid for retrieval.</small>}
       <small>Demo receipt. No real transaction.</small>
     </div>
@@ -103,7 +105,7 @@ function Receipt({ r }: { r: ReceiptData }) {
 }
 const receiptOf = (i: number, r: Rental): ReceiptData => ({
   txnId: r.txnId, locker: i, service: CONFIG.services[r.service].label, method: r.payMethod === 'coin' ? 'Coins' : 'Online QR', amount: r.amount, at: r.issuedAt,
-  type: r.qrToken || r.accessCode ? 'retrieval' : 'transaction', qrToken: r.qrToken, accessCode: r.accessCode,
+  type: r.qrToken || r.accessCode ? 'retrieval' : 'transaction', qrToken: r.qrToken, accessCode: r.accessCode, emergency: !!r.cardId,
 });
 
 function Steps({ stage, service }: { stage: Stage; service: string | null }) {
@@ -148,19 +150,22 @@ export default function UI() {
   const rented = rentals.length;
   const stages = s.sanStages, san = sanitationAt(s.sanitize, stages);
   const sanTitle = s.sanitize <= 0 ? 'Preparing the compartment' : s.sanitize >= 1 ? 'Cycle completed' : `${stages[san.index]?.label ?? ''} (${san.index + 1} of ${stages.length})`;
-  const av = d.methods.filter((m) => rentals.some(([, r]) => (m === 'nfc' ? !!r.cardId : m === 'otp' ? !!r.phone : m === 'qr' ? !!r.qrToken : !!r.accessCode)));
+  const lbl = (m: RetrievalMethod) => methodLabel(m, cfg.otp.verify);
+  const availOf = (l: RetrievalMethod[]) => l.filter((m) => rentals.some(([, r]) => hasCred(m, r)));
+  const av = { primary: availOf(d.plan.primary), emergency: availOf(d.plan.emergency) }; // from retrievalPlan(): NFC alone when enabled
+  const planText = d.plan.primary.map(lbl).join(' / ') + (d.plan.emergency.length ? ` (emergency: ${d.plan.emergency.map(lbl).join(' / ')})` : '');
   const retrievalReceipt = cfg.hardware.receiptPrinter && cfg.receipt.type === 'retrieval';
   const qrText: Record<string, string> = { show: 'Click the QR code to scan it with your phone.', phone: 'Phone approaching…', scanning: 'Scanning code…', processing: 'Opening payment app…', receipt: 'Payment confirmed on phone.', done: '✓ Payment Successful' };
   const curReceipt: ReceiptData = {
     txnId: s.txnId ?? '', locker: s.locker ?? 0, service: CONFIG.services[s.service ?? 'locker'].label, method: s.method === 'coin' ? 'Coins' : 'Online QR', amount: price, at: s.paidAt,
-    type: retrievalReceipt ? 'retrieval' : 'transaction', qrToken: s.qrToken, accessCode: s.accessCode,
+    type: retrievalReceipt ? 'retrieval' : 'transaction', qrToken: s.qrToken, accessCode: s.accessCode, emergency: cfg.hardware.nfc,
   };
 
   let body: ReactNode = null;
   switch (s.stage) {
     case 'welcome':
       body = (<><h1>Welcome to {CONFIG.brand}</h1>
-        <p>{rented === 0 ? `Secure helmet storage${d.stages.length ? ' with optional sanitation' : ''}. Lockers from ${peso(priceOf('locker'))}. You will get ${d.methods.length ? d.methods.map((m) => METHOD_LABEL[m]).join(' / ') : 'a credential'} to retrieve your helmet.` : `${rented} of ${d.total} lockers in use. Rent another locker or retrieve a stored helmet.`}</p>
+        <p>{rented === 0 ? `Secure helmet storage${d.stages.length ? ' with optional sanitation' : ''}. Lockers from ${peso(priceOf('locker'))}. Retrieve your helmet with ${planText || 'your credential'}.` : `${rented} of ${d.total} lockers in use. Rent another locker or retrieve a stored helmet.`}</p>
         {rented === 0 ? <Btn onClick={s.begin}>Begin</Btn>
           : <div className="row"><Btn onClick={s.begin} disabled={rented >= d.total}>{rented >= d.total ? 'All lockers in use' : 'Rent a locker'}</Btn><Btn ghost onClick={s.startRetrieval}>Retrieve Helmet</Btn></div>}</>);
       break;
@@ -188,12 +193,18 @@ export default function UI() {
     }
     case 'phone':
       body = s.phoneStep === 'enter'
-        ? (<><h2>Phone verification</h2><p>Enter a test phone number. A simulated SMS with a one-time code will appear on the demo phone. Nothing is sent for real.</p>
-          <CodeForm label="Test phone number" placeholder="0917 000 0000" cta="Send code" maxLength={14} onSubmit={s.submitPhone} />
+        ? (<><h2>{cfg.otp.verify ? 'Phone verification' : 'Phone number'}</h2>
+          <p>{cfg.otp.verify ? `Enter your phone number (${PHONE_DIGITS} digits). A simulated SMS with a one-time code will appear on the demo phone. Nothing is sent for real.` : `Enter your phone number (${PHONE_DIGITS} digits). It is used to retrieve your helmet.`}</p>
+          {!cfg.otp.verify && <p className="warnl">⚠ No OTP is sent. A wrong number may make retrieval impossible, so check it carefully.</p>}
+          <CodeForm label="Phone number" placeholder="09XXXXXXXXX" cta={cfg.otp.verify ? 'Send code' : 'Continue'} digitsOnly maxLength={PHONE_DIGITS} onSubmit={s.submitPhone} />
           {s.otpMsg && <p className="err">{s.otpMsg}</p>}<Btn ghost onClick={s.back}>Back</Btn></>)
-        : (<><h2>Enter the code</h2><p>Code sent to ••••{s.phone?.slice(-4)}. Valid for {cfg.otp.ttlSeconds}s, {cfg.otp.maxAttempts} attempts.</p>
-          <CodeForm key={s.otp?.code} label="One-time code" placeholder="6 digits" cta="Verify" maxLength={6} onSubmit={s.submitOtp} />
-          {s.otpMsg && <p className="err">{s.otpMsg}</p>}<Btn ghost onClick={s.resendOtp}>Resend code</Btn><Btn ghost onClick={s.back}>Back</Btn></>);
+        : s.phoneStep === 'confirm'
+          ? (<><h2>Is this number correct?</h2><p className="phonebig">{s.phone}</p>
+            <p className="warnl">⚠ No OTP is used. If this number is wrong, you may not be able to retrieve your helmet.</p>
+            <Btn onClick={s.confirmPhone}>Yes, continue</Btn><Btn ghost onClick={s.editPhone}>Edit number</Btn></>)
+          : (<><h2>Enter the code</h2><p>Code sent to ••••{s.phone?.slice(-4)}. Valid for {cfg.otp.ttlSeconds}s, {cfg.otp.maxAttempts} attempts.</p>
+            <CodeForm key={s.otp?.code} label="One-time code" placeholder="6 digits" cta="Verify" maxLength={6} digitsOnly onSubmit={s.submitOtp} />
+            {s.otpMsg && <p className="err">{s.otpMsg}</p>}<Btn ghost onClick={s.resendOtp}>Resend code</Btn><Btn ghost onClick={s.back}>Back</Btn></>);
       break;
     case 'payment':
       if (!s.method) body = (<><h2>Pay {peso(price)}</h2><p>Both methods are simulated. No real payment is made.</p>
@@ -223,7 +234,7 @@ export default function UI() {
     case 'receipt':
       body = (<><h2>{s.receipt === 'collected' ? 'Receipt collected' : 'Your receipt'}</h2>
         <p>{s.receipt === 'hidden' || s.receipt === 'printing' ? 'Printing your receipt…' : s.receipt === 'ready' || s.receipt === 'collecting' ? 'Click the paper to tear it off.'
-          : retrievalReceipt ? `Keep this receipt. It holds your retrieval ${[cfg.receipt.qr && 'QR code', cfg.receipt.code && 'access code'].filter(Boolean).join(' and ')}.` : 'This receipt is for your records only. It cannot unlock your locker.'}</p>
+          : retrievalReceipt ? `Keep this receipt. Its ${[cfg.receipt.qr && 'QR code', cfg.receipt.code && 'access code'].filter(Boolean).join(' and ')} ${cfg.hardware.nfc ? 'is an emergency credential, only for use if you lose your card.' : 'unlocks your locker.'}` : 'This receipt is for your records only. It cannot unlock your locker.'}</p>
         {s.receipt === 'ready' && <Btn onClick={s.collectReceipt}>Collect receipt</Btn>}
         {s.receipt === 'collected' && <Btn onClick={s.continueFromReceipt}>Continue</Btn>}</>);
       break;
@@ -248,30 +259,41 @@ export default function UI() {
         <Btn ghost onClick={s.skipSanitation}>Skip cycle (S)</Btn></>);
       break;
     case 'stored':
-      body = (<><h2>Helmet stored in Locker {(s.locker ?? 0) + 1}</h2><p>{s.service === 'sanitize' ? 'The simulated sanitation cycle is complete. ' : ''}Retrieve with: {d.methods.map((m) => METHOD_LABEL[m]).join(', ')}. Returning to the home screen…</p></>);
+      body = (<><h2>Helmet stored in Locker {(s.locker ?? 0) + 1}</h2><p>{s.service === 'sanitize' ? 'The simulated sanitation cycle is complete. ' : ''}Retrieve with: {planText}. Returning to the home screen…</p></>);
       break;
-    case 'retrieval':
-      if (s.ret === 'choose') body = (<><h2>Retrieve Helmet</h2><p>Choose how to unlock your locker.</p>
-        <div className="grid2">{av.map((m) => <button key={m} className="tile" onClick={() => s.chooseRetMethod(m)}><b>{METHOD_LABEL[m]}</b><span>{HINT[m]}</span></button>)}</div><Btn ghost onClick={s.back}>Back</Btn></>);
+    case 'retrieval': {
+      const lostLabel = d.plan.primary.includes('nfc') ? 'Lost your card?' : d.plan.primary.some((m) => m === 'qr' || m === 'code') ? 'Lost your receipt?' : '';
+      const lost = av.emergency.length > 0 && !s.retEmergency && lostLabel ? <Btn ghost onClick={s.startEmergency}>🆘 {lostLabel} Emergency retrieval</Btn> : null;
+      const tag = s.retEmergency ? <p className="warnl">🆘 Emergency retrieval: your {d.plan.primary.includes('nfc') ? 'card' : 'receipt'} is not needed.</p> : null;
+      const hintFor = (m: RetrievalMethod) => (m === 'otp' && !cfg.otp.verify ? 'Enter your phone number' : HINT[m]);
+      const demoPhones = rentals.filter(([, r]) => r.phone).map(([i, r]) => `Locker ${i + 1}: ${r.phone}`).join(' · ');
+      if (s.ret === 'choose') body = (<><h2>{s.retEmergency ? 'Emergency retrieval' : 'Retrieve Helmet'}</h2>{tag}<p>{s.retEmergency ? 'Choose an emergency way to unlock your locker.' : 'Choose how to unlock your locker.'}</p>
+        <div className="grid2">{(s.retEmergency ? av.emergency : av.primary).map((m) => <button key={m} className="tile" onClick={() => s.chooseRetMethod(m)}><b>{lbl(m)}</b><span>{hintFor(m)}</span></button>)}</div><Btn ghost onClick={s.back}>Back</Btn>{lost}</>);
       else if (s.ret === 'invalid') body = (<><h2>Not recognized</h2><p className="err">{s.retMsg}</p>{s.retMethod ? <Btn onClick={s.retry}>Try again</Btn> : <Btn ghost onClick={s.back}>Back</Btn>}</>);
       else if (s.ret === 'validating') body = (<><h2>Validating…</h2><div className="bar"><i className="indet" /></div></>);
-      else if (s.ret === 'otp') body = (<><h2>Enter your one-time code</h2><p>Sent to the phone for Locker {(s.retLocker ?? 0) + 1}. Valid for {cfg.otp.ttlSeconds}s, {cfg.otp.maxAttempts} attempts.</p>
-        <CodeForm key={s.otp?.code} label="One-time code" placeholder="6 digits" cta="Unlock" maxLength={6} onSubmit={s.submitRetrievalOtp} />
+      else if (s.ret === 'pick') body = (<><h2>Which locker?</h2><p>More than one helmet is linked to this number.</p>
+        <div className="grid2">{s.retPick.map((i) => <button key={i} className="tile" onClick={() => s.pickRetrievalLocker(i)}><b>Locker {i + 1}</b><span>Stored helmet</span></button>)}</div><Btn ghost onClick={s.back}>Back</Btn></>);
+      else if (s.ret === 'otp') body = (<><h2>Enter your one-time code</h2>{tag}<p>Sent to the phone for Locker {(s.retLocker ?? 0) + 1}. Valid for {cfg.otp.ttlSeconds}s, {cfg.otp.maxAttempts} attempts.</p>
+        <CodeForm key={s.otp?.code} label="One-time code" placeholder="6 digits" cta="Unlock" maxLength={6} digitsOnly onSubmit={s.submitRetrievalOtp} />
         {s.retMsg && <p className="err">{s.retMsg}</p>}<Btn ghost onClick={s.resendOtp}>Resend code</Btn><Btn ghost onClick={s.back}>Back</Btn></>);
       else if (s.ret === 'prompt' && s.retMethod === 'nfc') body = (<><h2>Present your access card</h2><p>Choose a card to tap on the reader (simulated).</p>
         <div className="grid2">{rentals.filter(([, r]) => r.cardId).map(([i, r]) => <button key={i} className="tile" onClick={() => s.presentCard(r.cardId!)}><b>Locker {i + 1} card</b><span>{r.cardId}</span></button>)}
-          <button className="tile" onClick={() => s.presentCard('HL-0000')}><b>Another card</b><span>HL-0000 (not issued)</span></button></div><Btn ghost onClick={s.back}>Back</Btn></>);
-      else if (s.ret === 'prompt' && s.retMethod === 'qr') body = (<><h2>Scan your receipt QR</h2><p>No camera is used. Pick a receipt to simulate the scanner reading it.</p>
+          <button className="tile" onClick={() => s.presentCard('HL-0000')}><b>Another card</b><span>HL-0000 (not issued)</span></button></div><Btn ghost onClick={s.back}>Back</Btn>{lost}</>);
+      else if (s.ret === 'prompt' && s.retMethod === 'qr') body = (<><h2>Scan your receipt QR</h2>{tag}<p>No camera is used. Pick a receipt to simulate the scanner reading it.</p>
         <div className="grid2">{rentals.filter(([, r]) => r.qrToken).map(([i, r]) => <button key={i} className="tile" onClick={() => s.scanReceipt(qrPayload(r.qrToken!))}><b>Receipt · Locker {i + 1}</b><span>Simulate scan</span></button>)}
           <button className="tile" onClick={() => s.scanReceipt('hl2:UNKNOWN')}><b>Unknown QR</b><span>Not from this kiosk</span></button></div>
-        <Btn ghost onClick={() => setShowReceipts(!showReceipts)}>{showReceipts ? 'Hide' : 'View'} my receipts</Btn><Btn ghost onClick={s.back}>Back</Btn></>);
-      else if (s.ret === 'prompt' && s.retMethod === 'code') body = (<><h2>Enter your access code</h2><p>Type the code printed on your receipt.</p>
-        <CodeForm label="Access code" placeholder="6 digits" cta="Unlock" maxLength={6} onSubmit={s.submitCode} />
-        <Btn ghost onClick={() => setShowReceipts(!showReceipts)}>{showReceipts ? 'Hide' : 'View'} my receipts (demo)</Btn><Btn ghost onClick={s.back}>Back</Btn></>);
-      else if (s.ret === 'prompt' && s.retMethod === 'otp') body = (<><h2>Which locker?</h2><p>A one-time code will be sent to the phone used for the rental (simulated).</p>
-        <div className="grid2">{rentals.filter(([, r]) => r.phone).map(([i, r]) => <button key={i} className="tile" onClick={() => s.requestRetrievalOtp(i)}><b>Locker {i + 1}</b><span>••••{r.phone!.slice(-4)}</span></button>)}</div><Btn ghost onClick={s.back}>Back</Btn></>);
+        <Btn ghost onClick={() => setShowReceipts(!showReceipts)}>{showReceipts ? 'Hide' : 'View'} my receipts</Btn><Btn ghost onClick={s.back}>Back</Btn>{lost}</>);
+      else if (s.ret === 'prompt' && s.retMethod === 'code') body = (<><h2>{s.retEmergency ? 'Enter your emergency code' : 'Enter your access code'}</h2>{tag}<p>Type the code printed on your receipt.</p>
+        <CodeForm label="Code" placeholder="6 digits" cta="Unlock" maxLength={6} digitsOnly onSubmit={s.submitCode} />
+        <Btn ghost onClick={() => setShowReceipts(!showReceipts)}>{showReceipts ? 'Hide' : 'View'} my receipts (demo)</Btn><Btn ghost onClick={s.back}>Back</Btn>{lost}</>);
+      else if (s.ret === 'prompt' && s.retMethod === 'otp') body = (<><h2>{s.retEmergency ? 'Emergency retrieval by phone' : 'Retrieve with your phone'}</h2>{tag}
+        <p>{cfg.otp.verify ? 'Enter the phone number used for the rental. A one-time code will be sent (simulated).' : 'Enter the phone number used for the rental.'}</p>
+        {!cfg.otp.verify && <p className="warnl">⚠ OTP is off: the number alone unlocks the locker.</p>}
+        <CodeForm label="Phone number" placeholder="09XXXXXXXXX" cta={cfg.otp.verify ? 'Send code' : 'Unlock'} digitsOnly maxLength={PHONE_DIGITS} onSubmit={s.submitRetrievalPhone} />
+        {s.retMsg && <p className="err">{s.retMsg}</p>}{demoPhones && <small>Demo hint, numbers on file: {demoPhones}</small>}<Btn ghost onClick={s.back}>Back</Btn></>);
       else body = (<><h2>{s.ret === 'ready' ? 'Take your helmet' : s.ret === 'taking' ? 'Removing helmet…' : '✓ Access granted'}</h2><p>{s.ret === 'ready' ? 'Click the helmet to remove it.' : `Opening Locker ${(s.locker ?? 0) + 1}…`}</p></>);
       break;
+    }
     case 'completed':
       body = (<><h1>Thanks for riding with {CONFIG.brand}</h1><p>Demo complete: storage{s.service === 'sanitize' ? ', sanitation' : ''} and retrieval were all simulated.{rented > 0 ? ` ${rented} other locker${rented > 1 ? 's are' : ' is'} still in use.` : ''}</p>
         <div className="row"><Btn onClick={() => s.reset('idle')}>Restart</Btn><Btn ghost onClick={() => s.home('welcome')}>Welcome screen</Btn><Btn ghost onClick={() => s.reset('idle', true)}>Replay guided intro</Btn></div></>);

@@ -137,3 +137,5 @@ input:focus, select:focus { outline:2px solid var(--teal); }
 .lk.san { background:#143d44; border-color:#2ee6d0; } .lk.occ { border-color:#ff5c5c; } .lk em { position:absolute; bottom:1px; right:4px; font-size:9px; color:#8b5cff; font-style:normal; }
 .admin footer { padding:14px 22px; border-top:1px solid #1f3a4d; max-height:34vh; overflow:auto; } .admin footer p { margin:0 0 6px; font-size:13px; } .warnl { color:#ffd88a; }
 @media (max-width:1250px) { .badge { display:none; } .steps { display:none; } }
+.phonebig { font:700 28px ui-monospace, Menlo, monospace; letter-spacing:.08em; margin:6px 0 10px; }
+.paper small { display:block; }

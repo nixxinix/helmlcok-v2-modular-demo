@@ -1,5 +1,5 @@
 import { ReactNode, useEffect, useMemo, useState } from 'react';
-import { useConfig, validateConfig, derive, checkApply, defaults, mkStage, STAGE_INFO, CLEAN_KEYS, DRY_KEYS, MAX_SECTIONS, METHOD_LABEL, totalSeconds, StageKey, SectionType } from './system';
+import { useConfig, validateConfig, derive, checkApply, defaults, mkStage, STAGE_INFO, CLEAN_KEYS, DRY_KEYS, MAX_SECTIONS, methodLabel, retrievalPlan, totalSeconds, StageKey, SectionType, SystemConfig, RetrievalMethod } from './system';
 import { useStore } from './store';
 import { sfx } from './sound';
 
@@ -14,6 +14,16 @@ function Check({ label, hint, checked, disabled, onChange }: { label: string; hi
 const Num = ({ label, value, min, max, onChange }: { label: string; value: number; min: number; max: number; onChange: (v: number) => void }) => (
   <label className="num">{label}<input type="number" value={value} min={min} max={max} onChange={(e) => onChange(Number(e.target.value))} /></label>
 );
+
+/** One-click retrieval setups (NFC is primary whenever it is on; other methods then become emergency-only). */
+const PRESETS: { name: string; apply: (c: SystemConfig) => void }[] = [
+  { name: 'NFC only', apply: (c) => { c.hardware.nfc = true; c.hardware.otp = false; c.hardware.receiptPrinter = false; } },
+  { name: 'NFC + phone OTP (emergency)', apply: (c) => { c.hardware.nfc = true; c.hardware.otp = true; c.otp.verify = true; c.hardware.receiptPrinter = false; } },
+  { name: 'NFC + receipt code (emergency)', apply: (c) => { c.hardware.nfc = true; c.hardware.otp = false; c.hardware.receiptPrinter = true; c.receipt = { type: 'retrieval', qr: false, code: true }; } },
+  { name: 'Phone OTP only', apply: (c) => { c.hardware.nfc = false; c.hardware.otp = true; c.otp.verify = true; c.hardware.receiptPrinter = false; } },
+  { name: 'Receipt code only', apply: (c) => { c.hardware.nfc = false; c.hardware.otp = false; c.hardware.receiptPrinter = true; c.receipt = { type: 'retrieval', qr: false, code: true }; } },
+];
+
 const Block = ({ title, children }: { title: string; children: ReactNode }) => <section className="ablock"><h3>{title}</h3>{children}</section>;
 
 /** System Configuration: edits a draft, previews it, then applies it to the live cabinet and kiosk without a reload. */
@@ -57,7 +67,7 @@ export default function Admin({ onClose }: { onClose: () => void }) {
         <Block title="A · Hardware modules">
           <Check label="Receipt printer" hint="Shows the printer and animated paper. Choose the receipt type in section B." checked={hw.receiptPrinter} onChange={(v) => edit((c) => { c.hardware.receiptPrinter = v; })} />
           <Check label="NFC card dispenser and reader" hint="Adds card issuance and card tap retrieval." checked={hw.nfc} onChange={(v) => edit((c) => { c.hardware.nfc = v; })} />
-          <Check label="Phone number and OTP verification" hint="Adds phone entry, simulated SMS and OTP retrieval." checked={hw.otp} onChange={(v) => edit((c) => { c.hardware.otp = v; })} />
+          <Check label="Phone number retrieval" hint="Adds phone entry at rental. Retrieval by number, with or without OTP (section B)." checked={hw.otp} onChange={(v) => edit((c) => { c.hardware.otp = v; })} />
           <Check label="Sanitation module" hint="UV-C is fixed as the first stage while this is on." checked={hw.sanitation} onChange={(v) => edit((c) => { c.hardware.sanitation = v; })} />
           <Check label="Air-drying module" hint="Drying is always the last stage." checked={draft.stages.some((s) => s.key === 'airdry')} disabled={!hw.sanitation} onChange={(v) => setStage('airdry', v)} />
           <Check label="Heat-drying module" hint="Requires the sanitation module." checked={draft.stages.some((s) => s.key === 'heatdry')} disabled={!hw.sanitation} onChange={(v) => setStage('heatdry', v)} />
@@ -66,7 +76,11 @@ export default function Admin({ onClose }: { onClose: () => void }) {
         </Block>
 
         <Block title="B · Retrieval and receipts">
-          <p className="note">Active retrieval methods: {d.methods.length ? d.methods.map((m) => METHOD_LABEL[m]).join(', ') : 'none'}. NFC and OTP follow the hardware toggles above.</p>
+          {(() => { const p = retrievalPlan(draft), l = (m: RetrievalMethod) => methodLabel(m, draft.otp.verify); return (
+            <p className="note"><b>Primary:</b> {p.primary.map(l).join(' / ') || 'none'}{p.emergency.length > 0 && <> · <b>Emergency only:</b> {p.emergency.map(l).join(' / ')}</>}. NFC is always primary when enabled; other methods then work only if the card is lost.</p>); })()}
+          <div className="addrow">Presets: {PRESETS.map((p) => <button key={p.name} className="btn ghost sm" onClick={() => edit(p.apply)}>{p.name}</button>)}</div>
+          <Check label="Require OTP verification" hint="ON: the number is verified by SMS code at rental and again at retrieval. OFF: only the number is entered and matched." checked={draft.otp.verify} disabled={!hw.otp} onChange={(v) => edit((c) => { c.otp.verify = v; })} />
+          {hw.otp && !draft.otp.verify && <p className="warnl">⚠ With OTP off, a mistyped number can make retrieval impossible, and anyone who knows the number can open the locker.</p>}
           <label className="num">Receipt type
             <select value={draft.receipt.type} disabled={!hw.receiptPrinter} onChange={(e) => edit((c) => { c.receipt.type = e.target.value as 'transaction' | 'retrieval'; })}>
               <option value="retrieval">Retrieval receipt (credential)</option><option value="transaction">Transaction receipt (record only)</option>

@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import gsap from 'gsap';
 import { CONFIG, coinsOf, priceOf, ServiceKey } from './config';
-import { useConfig, derive, sanitationAt, totalSeconds, StageCfg, StageKey, RetrievalMethod } from './system';
+import { useConfig, derive, sanitationAt, totalSeconds, retrievalPlan, StageCfg, StageKey, RetrievalMethod } from './system';
 import * as cred from './credentials';
 import { sfx } from './sound';
 
@@ -11,7 +11,7 @@ export type Method = 'coin' | 'qr';
 export type HelmetState = 'hidden' | 'offered' | 'placing' | 'inside' | 'removing' | 'gone';
 export type CardState = 'hidden' | 'out' | 'collecting' | 'collected';
 export type ReceiptState = 'hidden' | 'printing' | 'ready' | 'collecting' | 'collected';
-export type Ret = 'choose' | 'prompt' | 'otp' | 'validating' | 'invalid' | 'valid' | 'opening' | 'ready' | 'taking' | 'done';
+export type Ret = 'choose' | 'prompt' | 'pick' | 'otp' | 'validating' | 'invalid' | 'valid' | 'opening' | 'ready' | 'taking' | 'done';
 export type Qr = 'show' | 'phone' | 'scanning' | 'processing' | 'receipt' | 'done';
 export type OtpState = cred.Otp & { purpose: 'verify' | 'retrieve' };
 export interface Rental extends cred.Cred { txnId: string; service: Service; amount: number; payMethod: Method }
@@ -45,11 +45,11 @@ const txFresh = () => ({
   stage: 'idle' as Stage, locker: null as number | null, service: null as Service | null, method: null as Method | null,
   coins: 0, coinBusy: false, paid: false, qr: 'show' as Qr, wallet: CONFIG.wallets[0].id, qrRef: null as string | null, qrAt: null as number | null,
   txnId: null as string | null, paidAt: null as number | null,
-  phone: null as string | null, phoneStep: 'enter' as 'enter' | 'otp', otp: null as OtpState | null, sms: null as { text: string; at: number } | null, otpMsg: null as string | null,
+  phone: null as string | null, phoneStep: 'enter' as 'enter' | 'confirm' | 'otp', otp: null as OtpState | null, sms: null as { text: string; at: number } | null, otpMsg: null as string | null,
   receipt: 'hidden' as ReceiptState, qrToken: null as string | null, accessCode: null as string | null,
   cardId: null as string | null, card: 'hidden' as CardState, doorOpen: Array<boolean>(MAX_LOCKERS).fill(false), helmet: 'hidden' as HelmetState,
   sanitize: 0, sanStages: [] as StageCfg[],
-  ret: 'prompt' as Ret, retMethod: null as RetrievalMethod | null, retLocker: null as number | null, retMsg: null as string | null,
+  ret: 'prompt' as Ret, retMethod: null as RetrievalMethod | null, retLocker: null as number | null, retMsg: null as string | null, retEmergency: false, retPick: [] as number[],
   warning: false, hover: null as number | null,
 });
 
@@ -57,15 +57,15 @@ interface Actions {
   reset: (stage?: Stage, replay?: boolean) => void; home: (stage?: Stage) => void;
   screenClick: () => void; begin: () => void; back: () => void;
   selectLocker: (i: number) => void; selectService: (s: Service) => void;
-  submitPhone: (raw: string) => void; submitOtp: (code: string) => void; resendOtp: () => void; dismissSms: () => void;
+  submitPhone: (raw: string) => void; confirmPhone: () => void; editPhone: () => void; submitOtp: (code: string) => void; resendOtp: () => void; dismissSms: () => void;
   chooseMethod: (m: Method) => void; setWallet: (id: string) => void; scanQr: () => void; finishQr: () => void;
   insertCoin: () => void; completePayment: () => void;
   collectReceipt: () => void; receiptCollected: () => void; continueFromReceipt: () => void;
   collectCard: () => void; cardCollected: () => void; continueToPlacement: () => void;
   placeHelmet: () => void; helmetPlaced: () => void; finishStorage: () => void;
-  startRetrieval: () => void; chooseRetMethod: (m: RetrievalMethod) => void; presentCard: (id: string) => void;
+  startRetrieval: () => void; startEmergency: () => void; submitRetrievalPhone: (raw: string) => void; pickRetrievalLocker: (l: number) => void; chooseRetMethod: (m: RetrievalMethod) => void; presentCard: (id: string) => void;
   submitCode: (code: string) => void; scanReceipt: (payload: string) => void;
-  requestRetrievalOtp: (locker: number) => void; submitRetrievalOtp: (code: string) => void; retry: () => void;
+  submitRetrievalOtp: (code: string) => void; retry: () => void;
   takeHelmet: () => void; helmetRemoved: () => void; doorClick: (i: number) => void; setHover: (i: number | null) => void;
   toggleHotspots: () => void; setSpeed: (v: number) => void; skipSanitation: () => void;
 }
@@ -117,9 +117,25 @@ export const useStore = create<State>((set, get) => {
       if (r.locker === undefined) { set({ ret: 'invalid', retMsg: r.error ?? 'Credential not recognized.' }); sfx.error(); } else openFor(r.locker);
     }, T.validateMs);
   };
-  const availableMethods = (): RetrievalMethod[] => {
-    const rs = Object.values(get().rentals);
-    return derive(cfg()).methods.filter((m) => rs.some((x) => (m === 'nfc' ? !!x.cardId : m === 'otp' ? !!x.phone : m === 'qr' ? !!x.qrToken : !!x.accessCode)));
+  /** Retrieval methods per tier (from retrievalPlan), limited to methods that at least one stored rental holds a credential for. */
+  const planAvail = () => {
+    const rs = Object.values(get().rentals), plan = retrievalPlan(cfg());
+    const f = (l: RetrievalMethod[]) => l.filter((m) => rs.some((r) => cred.hasCred(m, r)));
+    return { primary: f(plan.primary), emergency: f(plan.emergency) };
+  };
+  const retReset = { retLocker: null, otp: null, sms: null, retMsg: null, retPick: [] as number[] };
+  const enterList = (list: RetrievalMethod[], emergency: boolean) =>
+    set({ retEmergency: emergency, retMethod: list.length === 1 ? list[0] : null, ret: list.length === 1 ? 'prompt' : 'choose', ...retReset });
+  const enterPrimary = () => {
+    const a = planAvail();
+    if (a.primary.length) enterList(a.primary, false);
+    else if (a.emergency.length) enterList(a.emergency, true); // stored helmets hold no primary credential: go straight to the fallback
+    else set({ ret: 'invalid', retMethod: null, retMsg: 'No enabled retrieval method matches the stored helmets.' });
+  };
+  const leaveRetrieval = () => set({ stage: 'welcome', ret: 'prompt', retMethod: null, retEmergency: false, ...retReset });
+  const sendRetrievalOtp = (l: number) => {
+    const ttl = cfg().otp.ttlSeconds, o = cred.newOtp(Date.now(), ttl * 1000);
+    set({ retLocker: l, ret: 'otp', otp: { ...o, purpose: 'retrieve' }, retMsg: null, retPick: [], sms: { text: smsText(o.code, ttl), at: Date.now() } }); sfx.sms();
   };
 
   return {
@@ -140,9 +156,11 @@ export const useStore = create<State>((set, get) => {
         const single = derive(cfg()).payMethods.length === 1;
         if (s.method && !single) set({ method: null, qr: 'show' });
         else set({ stage: 'service', service: null, method: null, qr: 'show', phone: null, otp: null, sms: null, phoneStep: 'enter' });
-      } else if (s.stage === 'retrieval' && ['choose', 'prompt', 'invalid', 'otp'].includes(s.ret)) {
-        if (s.ret === 'choose' || availableMethods().length < 2) set({ stage: 'welcome', ret: 'prompt', retMethod: null, otp: null, sms: null, retMsg: null });
-        else set({ ret: 'choose', retMethod: null, otp: null, sms: null, retMsg: null, retLocker: null });
+      } else if (s.stage === 'retrieval' && ['choose', 'prompt', 'invalid', 'otp', 'pick'].includes(s.ret)) {
+        const av = planAvail(), mine = s.retEmergency ? av.emergency : av.primary;
+        if (s.ret !== 'choose' && mine.length > 1) enterList(mine, s.retEmergency); // back to this tier's method list
+        else if (s.retEmergency && av.primary.length) enterPrimary(); // back from emergency to the normal method
+        else leaveRetrieval();
       }
     },
     selectLocker: (i) => { const s = get(); if (s.stage !== 'locker' || s.rentals[i] || i >= derive(cfg()).total) return; set({ locker: i, stage: 'service', hover: null }); sfx.select(); },
@@ -155,11 +173,15 @@ export const useStore = create<State>((set, get) => {
     /* ----- demo phone number + simulated OTP ----- */
     submitPhone: (raw) => {
       if (get().stage !== 'phone') return;
-      const digits = raw.replace(/\D/g, '');
-      if (digits.length < 10 || digits.length > 12) { set({ otpMsg: 'Enter a 10 to 12 digit test number.' }); sfx.error(); return; }
-      const ttl = cfg().otp.ttlSeconds, o = cred.newOtp(Date.now(), ttl * 1000);
+      const digits = cred.cleanPhone(raw); // digits only, max 11 (also covers pasted text)
+      if (!cred.isPhone(digits)) { set({ otpMsg: `Enter exactly ${cred.PHONE_DIGITS} digits (numbers only), e.g. 09123456789.` }); sfx.error(); return; }
+      const c = cfg();
+      if (!c.otp.verify) { set({ phone: digits, phoneStep: 'confirm', otpMsg: null }); sfx.select(); return; } // OTP OFF: no code is sent, just confirm the number
+      const ttl = c.otp.ttlSeconds, o = cred.newOtp(Date.now(), ttl * 1000);
       set({ phone: digits, phoneStep: 'otp', otp: { ...o, purpose: 'verify' }, otpMsg: null, sms: { text: smsText(o.code, ttl), at: Date.now() } }); sfx.sms();
     },
+    confirmPhone: () => { const s = get(); if (s.stage === 'phone' && s.phoneStep === 'confirm' && s.phone) { sfx.select(); toPayment(); } },
+    editPhone: () => { if (get().stage === 'phone') set({ phoneStep: 'enter', phone: null, otpMsg: null }); },
     submitOtp: (input) => {
       const s = get(); if (s.stage !== 'phone' || s.phoneStep !== 'otp') return;
       const r = cred.checkOtp(s.otp, input, Date.now(), cfg().otp.maxAttempts);
@@ -257,11 +279,11 @@ export const useStore = create<State>((set, get) => {
     /* ----- retrieval: method availability follows the active configuration ----- */
     startRetrieval: () => {
       const s = get(); if (s.stage !== 'welcome' || !Object.keys(s.rentals).length) return;
-      const av = availableMethods();
-      if (!av.length) { set({ stage: 'retrieval', ret: 'invalid', retMethod: null, retMsg: 'No enabled retrieval method matches the stored helmets.' }); return; }
-      set({ stage: 'retrieval', retMethod: av.length === 1 ? av[0] : null, ret: av.length === 1 ? 'prompt' : 'choose', retMsg: null, retLocker: null, otp: null });
+      set({ stage: 'retrieval' }); enterPrimary(); // NFC alone when enabled; otherwise the highest-priority configured method(s)
     },
-    chooseRetMethod: (m) => { if (get().stage === 'retrieval') set({ retMethod: m, ret: 'prompt', retMsg: null, retLocker: null, otp: null }); },
+    /** "Card / receipt lost": switch to the emergency method(s) of the active configuration. */
+    startEmergency: () => { const av = planAvail(); if (get().stage === 'retrieval' && av.emergency.length) { sfx.select(); enterList(av.emergency, true); } },
+    chooseRetMethod: (m) => { if (get().stage === 'retrieval') set({ retMethod: m, ret: 'prompt', ...retReset }); },
     presentCard: (id) => {
       if (!cfg().hardware.nfc || get().retMethod !== 'nfc') return;
       sfx.cardInsert();
@@ -279,11 +301,19 @@ export const useStore = create<State>((set, get) => {
       sfx.scan();
       runRetrieval(() => { const l = cred.matchQr(get().rentals, payload); return l === null ? { error: 'QR code not recognized.' } : { locker: l }; });
     },
-    requestRetrievalOtp: (l) => {
-      const s = get(), r = s.rentals[l];
-      if (s.stage !== 'retrieval' || s.retMethod !== 'otp' || !r?.phone) return;
-      const ttl = cfg().otp.ttlSeconds, o = cred.newOtp(Date.now(), ttl * 1000);
-      set({ retLocker: l, ret: 'otp', otp: { ...o, purpose: 'retrieve' }, retMsg: null, sms: { text: smsText(o.code, ttl), at: Date.now() } }); sfx.sms();
+    submitRetrievalPhone: (raw) => {
+      const s = get(); if (s.stage !== 'retrieval' || s.retMethod !== 'otp' || s.ret !== 'prompt') return;
+      const digits = cred.cleanPhone(raw);
+      if (!cred.isPhone(digits)) { set({ retMsg: `Enter exactly ${cred.PHONE_DIGITS} digits (numbers only).` }); sfx.error(); return; }
+      const hits = cred.matchPhone(s.rentals, digits);
+      if (!hits.length) { set({ ret: 'invalid', retMsg: 'No stored helmet is linked to this number.' }); sfx.error(); return; }
+      if (hits.length > 1) { set({ ret: 'pick', retPick: hits, retMsg: null }); return; }
+      get().pickRetrievalLocker(hits[0]);
+    },
+    pickRetrievalLocker: (l) => {
+      const s = get(); if (s.stage !== 'retrieval' || s.retMethod !== 'otp' || !s.rentals[l]?.phone) return;
+      if (cfg().otp.verify) sendRetrievalOtp(l); // OTP ON: send a fresh code and require it
+      else { set({ ret: 'prompt' }); runRetrieval(() => ({ locker: l })); } // OTP OFF: the number on file is the credential
     },
     submitRetrievalOtp: (input) => {
       const s = get(); if (s.stage !== 'retrieval' || s.ret !== 'otp' || s.retLocker === null) return;
